@@ -17,6 +17,7 @@ use OC\Files\View;
 use OCP\Files\FileInfo;
 use OCP\Lock\ILockingProvider;
 use OCP\Util;
+use Symfony\Component\EventDispatcher\GenericEvent;
 use Test\TestCase;
 
 class TemporaryNoTouch extends Temporary {
@@ -443,9 +444,25 @@ class ViewTest extends TestCase {
 		Filesystem::mount($storage1, [], '/');
 		Filesystem::mount($storage2, [], '/substorage');
 
+		$calledEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('view.aftercreate', function ($event) use (&$calledEvent) {
+			$calledEvent[] = 'view.aftercreate';
+			array_push($calledEvent, $event);
+		});
+
+		$calledCopyEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('view.aftercopy', function ($event) use (&$calledCopyEvent) {
+			$calledCopyEvent[] = 'view.aftercopy';
+			array_push($calledCopyEvent, $event);
+		});
+
 		$rootView = new View('');
 		$rootView->mkdir('substorage/emptyfolder');
 		$rootView->copy('substorage', 'anotherfolder');
+		$this->assertArrayHasKey('path', $calledEvent[1]);
+		$this->assertArrayHasKey('fileinfo', $calledEvent[1]);
+		$this->assertArrayHasKey('oldpath', $calledCopyEvent[1]);
+		$this->assertArrayHasKey('newpath', $calledCopyEvent[1]);
 		$this->assertTrue($rootView->is_dir('/anotherfolder'));
 		$this->assertTrue($rootView->is_dir('/substorage'));
 		$this->assertTrue($rootView->is_dir('/anotherfolder/emptyfolder'));
@@ -508,6 +525,12 @@ class ViewTest extends TestCase {
 		Filesystem::mount($storage1, [], '/');
 		Filesystem::mount($storage2, [], '/substorage');
 
+		$calledDeleteEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('\OC\Filesystem::delete_completed', function ($event) use (&$calledDeleteEvent) {
+			$calledDeleteEvent[] = '\OC\Filesystem::delete_completed';
+			array_push($calledDeleteEvent, $event);
+		});
+
 		$rootView = new View('');
 		$rootView->file_put_contents('/foo.txt', 'asd');
 		$rootView->file_put_contents('/substorage/bar.txt', 'asd');
@@ -539,9 +562,19 @@ class ViewTest extends TestCase {
 		$rootView->mkdir('sub/deep');
 		$rootView->file_put_contents('/sub/deep/foo.txt', 'asd');
 
+		$calledDeleteEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('view.afterdelete', function ($event) use (&$calledDeleteEvent) {
+			$calledDeleteEvent[] = 'view.afterdelete';
+			array_push($calledDeleteEvent, $event);
+		});
+
 		$this->assertTrue($rootView->file_exists('sub/deep/foo.txt'));
 
 		$this->assertTrue($rootView->$method('sub'));
+
+		$this->assertInstanceOf(GenericEvent::class, $calledDeleteEvent[1]);
+		$this->assertArrayHasKey('path', $calledDeleteEvent[1]);
+
 
 		$this->assertFalse($rootView->file_exists('sub'));
 	}
@@ -1117,9 +1150,20 @@ class ViewTest extends TestCase {
 		$view->touch('/test/foo', $time);
 		$view->touch('/test/foo/bar.txt', $time);
 
+		$calledEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('view.afterrename', function ($event) use (&$calledEvent) {
+			$calledEvent[] = 'view.afterrename';
+			array_push($calledEvent, $event);
+		});
 		$view->rename('/test/foo.txt', '/test/sub/storage/foo.txt');
 
 		$this->assertEquals($time, $view->filemtime('/test/sub/storage/foo.txt'));
+
+		$this->assertEquals('view.afterrename', $calledEvent[0]);
+		$this->assertInstanceOf(GenericEvent::class, $calledEvent[1]);
+		$this->assertArrayHasKey('oldpath', $calledEvent[1]);
+		$this->assertArrayHasKey('newpath', $calledEvent[1]);
+		$this->assertArrayHasKey('newfileinfo', $calledEvent[1]);
 
 		$view->rename('/test/foo', '/test/sub/storage/foo');
 
@@ -2236,8 +2280,17 @@ class ViewTest extends TestCase {
 		$this->assertNull($this->getFileLockType($view, $sourcePath), 'Source file not locked before operation');
 		$this->assertNull($this->getFileLockType($view, $targetPath), 'Target file not locked before operation');
 
+		$calledCreateEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('view.aftercreate', function ($event) use (&$calledCreateEvent) {
+			$calledCreateEvent[] = 'view.aftercreate';
+			array_push($calledCreateEvent, $event);
+		});
 		$view->$viewOperation($sourcePath, $targetPath);
 
+		if ($viewOperation === 'copy') {
+			$this->assertArrayHasKey('path', $calledCreateEvent[1]);
+			$this->assertArrayHasKey('fileinfo', $calledCreateEvent[1]);
+		}
 		$this->assertEquals(ILockingProvider::LOCK_SHARED, $lockTypeSourcePre, 'Source file locked properly during pre-hook');
 		$this->assertEquals($expectedLockTypeSourceDuring, $lockTypeSourceDuring, 'Source file locked properly during operation');
 		$this->assertEquals(ILockingProvider::LOCK_SHARED, $lockTypeSourcePost, 'Source file locked properly during post-hook');
@@ -2292,7 +2345,15 @@ class ViewTest extends TestCase {
 		$this->assertNull($this->getFileLockType($view, $sourcePath, true), 'Source path not locked before operation');
 		$this->assertNull($this->getFileLockType($view, $targetPath, true), 'Target path not locked before operation');
 
+		$calledRenameEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('view.afterrename', function ($event) use (&$calledRenameEvent) {
+			$calledRenameEvent[] = 'view.afterrename';
+			array_push($calledRenameEvent, $event);
+		});
+
 		$view->rename($sourcePath, $targetPath);
+		$this->assertArrayHasKey('oldpath', $calledRenameEvent[1]);
+		$this->assertArrayHasKey('newpath', $calledRenameEvent[1]);
 
 		$this->assertEquals(ILockingProvider::LOCK_SHARED, $lockTypeSourcePre, 'Source path locked properly during pre-hook');
 		$this->assertEquals(ILockingProvider::LOCK_EXCLUSIVE, $lockTypeSourceDuring, 'Source path locked properly during operation');
@@ -2450,10 +2511,18 @@ class ViewTest extends TestCase {
 		Filesystem::mount($storage1, [], $root . '/');
 		$view = new View($root);
 
+		$calledUpdateEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('view.afterupdate', function ($event) use (&$calledUpdateEvent) {
+			$calledUpdateEvent[] = 'view.afterupdate';
+			array_push($calledUpdateEvent, $event);
+		});
 		$view->file_put_contents('test1.txt', 'asd');
 		$view->file_put_contents('test2.txt', 'asd');
 		$view->file_put_contents('test3.md', 'asd');
 		$view->file_put_contents('test4.png', '');
+
+		$this->assertEquals('view.afterupdate', $calledUpdateEvent[0]);
+		$this->assertArrayHasKey('path', $calledUpdateEvent[1]);
 
 		$content = $view->getDirectoryContent('', $filter);
 
@@ -2485,10 +2554,18 @@ class ViewTest extends TestCase {
 		Filesystem::mount($storage, [], '/files');
 		$scanner->scan('');
 
+		$calledReadEvent = [];
+		\OC::$server->getEventDispatcher()->addListener('view.afterread', function ($event) use (&$calledReadEvent) {
+			$calledReadEvent[] = 'view.afterread';
+			array_push($calledReadEvent, $event);
+		});
 		// Obtain view on the file and check content + checksum
 		// If we insert file using $storage->file_put_contents checksum is not being calculated (null)
 		$view = new View('/files');
 		$this->assertEquals('bar', $view->file_get_contents('files/foo.txt'));
+		$this->assertEquals('view.afterread', $calledReadEvent[0]);
+		$this->assertArrayHasKey('path', $calledReadEvent[1]);
+		$this->assertInstanceOf(GenericEvent::class, $calledReadEvent[1]);
 		$data = $view->getFileInfo('files/foo.txt');
 		$this->assertNull($data->getChecksum());
 

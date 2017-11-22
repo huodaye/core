@@ -51,6 +51,7 @@ use OC\Files\Mount\MoveableMount;
 use OC\Files\Storage\Storage;
 use OC\User\RemoteUser;
 use OCP\Constants;
+use OCP\Events\EventEmitterTrait;
 use OCP\Files\Cache\ICacheEntry;
 use OCP\Files\FileNameTooLongException;
 use OCP\Files\InvalidCharacterInPathException;
@@ -62,6 +63,7 @@ use OCP\Lock\ILockingProvider;
 use OCP\Lock\LockedException;
 use OCA\Files_Sharing\SharedMount;
 use OCP\Util;
+use Symfony\Component\EventDispatcher\GenericEvent;
 
 /**
  * Class to provide access to ownCloud filesystem via a "view", and methods for
@@ -80,6 +82,7 @@ use OCP\Util;
  * \OC\Files\Storage\Storage object
  */
 class View {
+	use EventEmitterTrait;
 	/** @var string */
 	private $fakeRoot = '';
 
@@ -88,11 +91,20 @@ class View {
 	 */
 	private $lockingProvider;
 
+	/** @var bool  */
 	private $lockingEnabled;
 
+	/** @var bool  */
 	private $updaterEnabled = true;
 
+	/** @var \OC\User\Manager  */
 	private $userManager;
+
+	/** @var \Symfony\Component\EventDispatcher\EventDispatcherInterface  */
+	private $eventDispatcher;
+
+	/** @var \OCP\ILogger  */
+	private $logger;
 
 
 	/**
@@ -111,6 +123,8 @@ class View {
 		$this->lockingProvider = \OC::$server->getLockingProvider();
 		$this->lockingEnabled = !($this->lockingProvider instanceof \OC\Lock\NoopLockingProvider);
 		$this->userManager = \OC::$server->getUserManager();
+		$this->eventDispatcher = \OC::$server->getEventDispatcher();
+		$this->logger = \OC::$server->getLogger();
 	}
 
 	public function getAbsolutePath($path = '/') {
@@ -260,7 +274,14 @@ class View {
 	 * for \OC\Files\Storage\Storage via basicOperation().
 	 */
 	public function mkdir($path) {
-		return $this->basicOperation('mkdir', $path, ['create', 'write']);
+		return $this->emittingCall(function () use (&$path) {
+			$result = $this->basicOperation('mkdir', $path, ['create', 'write']);
+			$this->eventDispatcher->dispatch('view.aftercreate.data', new GenericEvent(null, [
+				'path' => $path,
+				'fileinfo' => $this->getFileInfo($path)
+			]));
+			return $result;
+		}, ['before' => ['path' => $path]], 'view', 'create');
 	}
 
 	/**
@@ -333,23 +354,36 @@ class View {
 	 * @return bool|mixed
 	 */
 	public function rmdir($path) {
-		$absolutePath = $this->getAbsolutePath($path);
-		$mount = Filesystem::getMountManager()->find($absolutePath);
-		if ($mount->getInternalPath($absolutePath) === '') {
-			return $this->removeMount($mount, $absolutePath);
-		}
-		if ($this->is_dir($path)) {
-			$result = $this->basicOperation('rmdir', $path, ['delete']);
-		} else {
-			$result = false;
-		}
+		return $this->emittingCall(function () use (&$path) {
+			$event = new GenericEvent(null);
+			$absolutePath = $this->getAbsolutePath($path);
+			$mount = Filesystem::getMountManager()->find($absolutePath);
+			if ($mount->getInternalPath($absolutePath) === '') {
+				return $this->removeMount($mount, $absolutePath);
+			}
+			if ($this->is_dir($path)) {
+				$event->setArgument('path', $path);
+				try {
+					$event->setArgument('fileinfo', $this->getFileInfo($path));
+				} catch (\Exception $e) {
+					$this->logger->logException($e);
+				}
+				$result = $this->basicOperation('rmdir', $path, ['delete']);
+			} else {
+				$result = false;
+			}
 
-		if (!$result && !$this->file_exists($path)) { //clear ghost files from the cache on delete
-			$storage = $mount->getStorage();
-			$internalPath = $mount->getInternalPath($absolutePath);
-			$storage->getUpdater()->remove($internalPath);
-		}
-		return $result;
+			if (!$result && !$this->file_exists($path)) { //clear ghost files from the cache on delete
+				$storage = $mount->getStorage();
+				$internalPath = $mount->getInternalPath($absolutePath);
+				$storage->getUpdater()->remove($internalPath);
+			}
+
+			if ($result) {
+				$this->eventDispatcher->dispatch('view.afterdelete.data', $event);
+			}
+			return $result;
+		}, ['before' => ['path' => $path]], 'view', 'delete');
 	}
 
 	/**
@@ -561,7 +595,22 @@ class View {
 	 * @return mixed
 	 */
 	public function file_get_contents($path) {
-		return $this->basicOperation('file_get_contents', $path, ['read']);
+		return $this->emittingCall(function () use (&$path) {
+			$event = new GenericEvent(null, [
+				'path' => $path
+			]);
+			try {
+				$event->setArgument('fileinfo', $this->getFileInfo($path));
+			} catch (\Exception $e) {
+				$this->logger->logException($e);
+			}
+
+			$result = $this->basicOperation('file_get_contents', $path, ['read']);
+			if (!is_null($result) && !empty($result)) {
+				$this->eventDispatcher->dispatch('view.afterread.data', $event);
+			}
+			return $result;
+		}, ['before' => ['path' => $path]], 'view', 'read');
 	}
 
 	/**
@@ -580,6 +629,12 @@ class View {
 				Filesystem::signal_param_path => $this->getHookPath($path),
 				Filesystem::signal_param_run => &$run,
 			]);
+			$event = new GenericEvent(null, [
+				'path' => $this->getHookPath($path),
+				'run' => $run
+			]);
+
+			$this->eventDispatcher->dispatch('\OC\Filesystem::update', $event);
 		}
 		\OC_Hook::emit(Filesystem::CLASSNAME, Filesystem::signal_write, [
 			Filesystem::signal_param_path => $this->getHookPath($path),
@@ -592,18 +647,31 @@ class View {
 	 * @param string $path
 	 */
 	protected function emit_file_hooks_post($exists, $path) {
-		if (!$exists) {
-			\OC_Hook::emit(Filesystem::CLASSNAME, Filesystem::signal_post_create, [
+		// A post event so no before event args required
+		return $this->emittingCall(function () use (&$exists, &$path){
+			if (!$exists) {
+				\OC_Hook::emit(Filesystem::CLASSNAME, Filesystem::signal_post_create, [
+					Filesystem::signal_param_path => $this->getHookPath($path),
+				]);
+				try {
+					$path1FileInfo = $this->getFileInfo($path);
+				} catch (\Exception $e) {
+					$path1FileInfo = false;
+				}
+				$event = new GenericEvent(null, [
+					'path' => $path,
+					'fileinfo' => $path1FileInfo
+				]);
+				$this->eventDispatcher->dispatch('view.aftercreate.data', $event);
+			} else {
+				\OC_Hook::emit(Filesystem::CLASSNAME, Filesystem::signal_post_update, [
+					Filesystem::signal_param_path => $this->getHookPath($path),
+				]);
+			}
+			\OC_Hook::emit(Filesystem::CLASSNAME, Filesystem::signal_post_write, [
 				Filesystem::signal_param_path => $this->getHookPath($path),
 			]);
-		} else {
-			\OC_Hook::emit(Filesystem::CLASSNAME, Filesystem::signal_post_update, [
-				Filesystem::signal_param_path => $this->getHookPath($path),
-			]);
-		}
-		\OC_Hook::emit(Filesystem::CLASSNAME, Filesystem::signal_post_write, [
-			Filesystem::signal_param_path => $this->getHookPath($path),
-		]);
+		}, ['before' => []], 'view', 'create');
 	}
 
 	/**
@@ -613,55 +681,66 @@ class View {
 	 * @throws \Exception
 	 */
 	public function file_put_contents($path, $data) {
-		if (is_resource($data)) { //not having to deal with streams in file_put_contents makes life easier
-			$absolutePath = Filesystem::normalizePath($this->getAbsolutePath($path));
-			if (Filesystem::isValidPath($path)
-				and !Filesystem::isForbiddenFileOrDir($path)
-			) {
-				$path = $this->getRelativePath($absolutePath);
+		return $this->emittingCall(function () use (&$path, &$data) {
+			if (is_resource($data)) { //not having to deal with streams in file_put_contents makes life easier
+				$absolutePath = Filesystem::normalizePath($this->getAbsolutePath($path));
+				if (Filesystem::isValidPath($path)
+					and !Filesystem::isForbiddenFileOrDir($path)
+				) {
+					$path = $this->getRelativePath($absolutePath);
 
-				$this->lockFile($path, ILockingProvider::LOCK_SHARED);
+					$this->lockFile($path, ILockingProvider::LOCK_SHARED);
 
-				$exists = $this->file_exists($path);
-				$run = true;
-				if ($this->shouldEmitHooks($path)) {
-					$this->emit_file_hooks_pre($exists, $path, $run);
-				}
-				if (!$run) {
-					$this->unlockFile($path, ILockingProvider::LOCK_SHARED);
-					return false;
-				}
-
-				$this->changeLock($path, ILockingProvider::LOCK_EXCLUSIVE);
-
-				/** @var \OC\Files\Storage\Storage $storage */
-				list($storage, $internalPath) = $this->resolvePath($path);
-				$target = $storage->fopen($internalPath, 'w');
-				if ($target) {
-					list (, $result) = \OC_Helper::streamCopy($data, $target);
-					fclose($target);
-					fclose($data);
-
-					$this->writeUpdate($storage, $internalPath);
-
-					$this->changeLock($path, ILockingProvider::LOCK_SHARED);
-
-					if ($this->shouldEmitHooks($path) && $result !== false) {
-						$this->emit_file_hooks_post($exists, $path);
+					$exists = $this->file_exists($path);
+					$run = true;
+					if ($this->shouldEmitHooks($path)) {
+						$this->emit_file_hooks_pre($exists, $path, $run);
 					}
-					$this->unlockFile($path, ILockingProvider::LOCK_SHARED);
-					return $result;
+					if (!$run) {
+						$this->unlockFile($path, ILockingProvider::LOCK_SHARED);
+						return false;
+					}
+
+					$this->changeLock($path, ILockingProvider::LOCK_EXCLUSIVE);
+
+					/** @var \OC\Files\Storage\Storage $storage */
+					list($storage, $internalPath) = $this->resolvePath($path);
+					$target = $storage->fopen($internalPath, 'w');
+					if ($target) {
+						list (, $result) = \OC_Helper::streamCopy($data, $target);
+						fclose($target);
+						fclose($data);
+
+						$this->writeUpdate($storage, $internalPath);
+
+						$this->changeLock($path, ILockingProvider::LOCK_SHARED);
+
+						if ($this->shouldEmitHooks($path) && $result !== false) {
+							$this->emit_file_hooks_post($exists, $path);
+						}
+						$this->unlockFile($path, ILockingProvider::LOCK_SHARED);
+						return $result;
+					} else {
+						$this->unlockFile($path, ILockingProvider::LOCK_EXCLUSIVE);
+						return false;
+					}
 				} else {
-					$this->unlockFile($path, ILockingProvider::LOCK_EXCLUSIVE);
 					return false;
 				}
 			} else {
-				return false;
+				$hooks = ($this->file_exists($path)) ? ['update', 'write'] : ['create', 'write'];
+				$event = new GenericEvent(null, [
+					'path' => $path
+				]);
+				try {
+					$event->setArgument('fileinfo', $this->getFileInfo($path));
+				} catch (\Exception $e) {
+					$this->logger->logException($e);
+				}
+				$this->eventDispatcher->dispatch('view.afterupdate.data', $event);
+				return $this->basicOperation('file_put_contents', $path, $hooks, $data);
 			}
-		} else {
-			$hooks = ($this->file_exists($path)) ? ['update', 'write'] : ['create', 'write'];
-			return $this->basicOperation('file_put_contents', $path, $hooks, $data);
-		}
+		}, ['before' => []], 'view', 'update');
 	}
 
 	/**
@@ -669,29 +748,41 @@ class View {
 	 * @return bool|mixed
 	 */
 	public function unlink($path) {
-		if ($path === '' || $path === '/') {
-			// do not allow deleting the root
-			return false;
-		}
-		$postFix = (substr($path, -1, 1) === '/') ? '/' : '';
-		$absolutePath = Filesystem::normalizePath($this->getAbsolutePath($path));
-		$mount = Filesystem::getMountManager()->find($absolutePath . $postFix);
-		if ($mount and $mount->getInternalPath($absolutePath) === '') {
-			return $this->removeMount($mount, $absolutePath);
-		}
-		if ($this->is_dir($path)) {
-			$result = $this->basicOperation('rmdir', $path, array('delete'));
-		} else {
-			$result = $this->basicOperation('unlink', $path, array('delete'));
-		}
-		if (!$result && !$this->file_exists($path)) { //clear ghost files from the cache on delete
-			$storage = $mount->getStorage();
-			$internalPath = $mount->getInternalPath($absolutePath);
-			$storage->getUpdater()->remove($internalPath);
-			return true;
-		} else {
-			return $result;
-		}
+		return $this->emittingCall(function () use (&$path) {
+			if ($path === '' || $path === '/') {
+				// do not allow deleting the root
+				return false;
+			}
+			$event = new GenericEvent(null, []);
+			$postFix = (substr($path, -1, 1) === '/') ? '/' : '';
+			$absolutePath = Filesystem::normalizePath($this->getAbsolutePath($path));
+			$mount = Filesystem::getMountManager()->find($absolutePath . $postFix);
+			if ($mount and $mount->getInternalPath($absolutePath) === '') {
+				return $this->removeMount($mount, $absolutePath);
+			}
+			$event->setArgument('path', $path);
+			try {
+				$event->setArgument('fileinfo', $this->getFileInfo($path));
+			} catch (\Exception $e) {
+				$this->logger->logException($e);
+			}
+			if ($this->is_dir($path)) {
+				$result = $this->basicOperation('rmdir', $path, array('delete'));
+			} else {
+				$result = $this->basicOperation('unlink', $path, array('delete'));
+			}
+			if ($result) {
+				$this->eventDispatcher->dispatch('view.afterdelete.data', $event);
+			}
+			if (!$result && !$this->file_exists($path)) { //clear ghost files from the cache on delete
+				$storage = $mount->getStorage();
+				$internalPath = $mount->getInternalPath($absolutePath);
+				$storage->getUpdater()->remove($internalPath);
+				return true;
+			} else {
+				return $result;
+			}
+		}, ['before' => []], 'view', 'delete');
 	}
 
 	/**
@@ -711,115 +802,139 @@ class View {
 	 * @return bool|mixed
 	 */
 	public function rename($path1, $path2) {
-		$absolutePath1 = Filesystem::normalizePath($this->getAbsolutePath($path1));
-		$absolutePath2 = Filesystem::normalizePath($this->getAbsolutePath($path2));
-		$result = false;
-		if (
-			Filesystem::isValidPath($path2)
-			and Filesystem::isValidPath($path1)
-			and !Filesystem::isForbiddenFileOrDir($path2)
-		) {
-			$path1 = $this->getRelativePath($absolutePath1);
-			$path2 = $this->getRelativePath($absolutePath2);
-			$exists = $this->file_exists($path2);
+		return $this->emittingCall(function () use (&$path1, &$path2) {
+			$absolutePath1 = Filesystem::normalizePath($this->getAbsolutePath($path1));
+			$absolutePath2 = Filesystem::normalizePath($this->getAbsolutePath($path2));
+			$result = false;
+			$event = new GenericEvent(null, []);
+			if (
+				Filesystem::isValidPath($path2)
+				and Filesystem::isValidPath($path1)
+				and !Filesystem::isForbiddenFileOrDir($path2)
+			) {
+				$path1 = $this->getRelativePath($absolutePath1);
+				$path2 = $this->getRelativePath($absolutePath2);
+				$exists = $this->file_exists($path2);
 
-			if ($path1 == null or $path2 == null) {
-				return false;
-			}
-
-			$this->lockFile($path1, ILockingProvider::LOCK_SHARED, true);
-			try {
-				$this->lockFile($path2, ILockingProvider::LOCK_SHARED, true);
-			} catch (LockedException $e) {
-				$this->unlockFile($path1, ILockingProvider::LOCK_SHARED);
-				throw $e;
-			}
-
-			$run = true;
-			if ($this->shouldEmitHooks($path1) && (Cache\Scanner::isPartialFile($path1) && !Cache\Scanner::isPartialFile($path2))) {
-				// if it was a rename from a part file to a regular file it was a write and not a rename operation
-				$this->emit_file_hooks_pre($exists, $path2, $run);
-			} elseif ($this->shouldEmitHooks($path1)) {
-				\OC_Hook::emit(
-					Filesystem::CLASSNAME, Filesystem::signal_rename,
-					[
-						Filesystem::signal_param_oldpath => $this->getHookPath($path1),
-						Filesystem::signal_param_newpath => $this->getHookPath($path2),
-						Filesystem::signal_param_run => &$run
-					]
-				);
-			}
-			if ($run) {
-				$this->verifyPath(dirname($path2), basename($path2));
-
-				$manager = Filesystem::getMountManager();
-				$mount1 = $this->getMount($path1);
-				$mount2 = $this->getMount($path2);
-				$storage1 = $mount1->getStorage();
-				$storage2 = $mount2->getStorage();
-				$internalPath1 = $mount1->getInternalPath($absolutePath1);
-				$internalPath2 = $mount2->getInternalPath($absolutePath2);
-
-				$this->changeLock($path1, ILockingProvider::LOCK_EXCLUSIVE, true);
-				$this->changeLock($path2, ILockingProvider::LOCK_EXCLUSIVE, true);
-
-				if ($internalPath1 === '' and $mount1 instanceof MoveableMount) {
-					if ($this->canMove($mount1, $absolutePath2)) {
-						/**
-						 * @var \OC\Files\Mount\MountPoint | \OC\Files\Mount\MoveableMount $mount1
-						 */
-						$sourceMountPoint = $mount1->getMountPoint();
-						$result = $mount1->moveMount($absolutePath2);
-						$manager->moveMount($sourceMountPoint, $mount1->getMountPoint());
-					} else {
-						$result = false;
-					}
-					// moving a file/folder within the same mount point
-				} elseif ($storage1 === $storage2) {
-					if ($storage1) {
-						$result = $storage1->rename($internalPath1, $internalPath2);
-					} else {
-						$result = false;
-					}
-					// moving a file/folder between storages (from $storage1 to $storage2)
-				} else {
-					$result = $storage2->moveFromStorage($storage1, $internalPath1, $internalPath2);
+				if ($path1 == null or $path2 == null) {
+					return false;
 				}
 
-				if ((Cache\Scanner::isPartialFile($path1) && !Cache\Scanner::isPartialFile($path2)) && $result !== false) {
+				$this->lockFile($path1, ILockingProvider::LOCK_SHARED, true);
+				try {
+					$this->lockFile($path2, ILockingProvider::LOCK_SHARED, true);
+				} catch (LockedException $e) {
+					$this->unlockFile($path1, ILockingProvider::LOCK_SHARED);
+					throw $e;
+				}
+
+				$run = true;
+				$event->setArgument('oldpath', $this->getHookPath($path1));
+				$event->setArgument('newpath', $this->getHookPath($path2));
+				if ($this->shouldEmitHooks($path1) && (Cache\Scanner::isPartialFile($path1) && !Cache\Scanner::isPartialFile($path2))) {
 					// if it was a rename from a part file to a regular file it was a write and not a rename operation
+					$this->emit_file_hooks_pre($exists, $path2, $run);
+				} elseif ($this->shouldEmitHooks($path1)) {
+					$event->setArgument('oldfileinfo', $this->getFileInfo($path1));
+					try {
+						$event->setArgument('owner', Filesystem::getOwner($this->getHookPath($path1)));
+					} catch (\Exception $e) {
+						/**
+						 * Nothing to do. A special case when shared file/folder is renamed
+						 */
+					}
+					\OC_Hook::emit(
+						Filesystem::CLASSNAME, Filesystem::signal_rename,
+						[
+							Filesystem::signal_param_oldpath => $this->getHookPath($path1),
+							Filesystem::signal_param_newpath => $this->getHookPath($path2),
+							Filesystem::signal_param_run => &$run
+						]
+					);
+					$this->eventDispatcher->dispatch('view.beforerename.data', $event);
+				}
+				if ($run) {
+					$this->verifyPath(dirname($path2), basename($path2));
 
-					$this->writeUpdate($storage2, $internalPath2);
-				} else if ($result) {
-					if ($internalPath1 !== '') { // don't do a cache update for moved mounts
-						$this->renameUpdate($storage1, $storage2, $internalPath1, $internalPath2);
+					$manager = Filesystem::getMountManager();
+					$mount1 = $this->getMount($path1);
+					$mount2 = $this->getMount($path2);
+					$storage1 = $mount1->getStorage();
+					$storage2 = $mount2->getStorage();
+					$internalPath1 = $mount1->getInternalPath($absolutePath1);
+					$internalPath2 = $mount2->getInternalPath($absolutePath2);
+
+					$this->changeLock($path1, ILockingProvider::LOCK_EXCLUSIVE, true);
+					$this->changeLock($path2, ILockingProvider::LOCK_EXCLUSIVE, true);
+
+					if ($internalPath1 === '' and $mount1 instanceof MoveableMount) {
+						if ($this->canMove($mount1, $absolutePath2)) {
+							/**
+							 * @var \OC\Files\Mount\MountPoint | \OC\Files\Mount\MoveableMount $mount1
+							 */
+							$sourceMountPoint = $mount1->getMountPoint();
+							$result = $mount1->moveMount($absolutePath2);
+							$manager->moveMount($sourceMountPoint, $mount1->getMountPoint());
+						} else {
+							$result = false;
+						}
+						// moving a file/folder within the same mount point
+					} elseif ($storage1 === $storage2) {
+						if ($storage1) {
+							$result = $storage1->rename($internalPath1, $internalPath2);
+						} else {
+							$result = false;
+						}
+						// moving a file/folder between storages (from $storage1 to $storage2)
+					} else {
+						$result = $storage2->moveFromStorage($storage1, $internalPath1, $internalPath2);
+					}
+
+					if ((Cache\Scanner::isPartialFile($path1) && !Cache\Scanner::isPartialFile($path2)) && $result !== false) {
+						// if it was a rename from a part file to a regular file it was a write and not a rename operation
+
+						$this->writeUpdate($storage2, $internalPath2);
+					} else if ($result) {
+						if ($internalPath1 !== '') { // don't do a cache update for moved mounts
+							$this->renameUpdate($storage1, $storage2, $internalPath1, $internalPath2);
+						}
+					}
+
+					$this->changeLock($path1, ILockingProvider::LOCK_SHARED, true);
+					$this->changeLock($path2, ILockingProvider::LOCK_SHARED, true);
+
+					if ((Cache\Scanner::isPartialFile($path1) && !Cache\Scanner::isPartialFile($path2)) && $result !== false) {
+						if ($this->shouldEmitHooks()) {
+							$this->emit_file_hooks_post($exists, $path2);
+						}
+					} elseif ($result) {
+						if ($this->shouldEmitHooks($path1) and $this->shouldEmitHooks($path2)) {
+							\OC_Hook::emit(
+								Filesystem::CLASSNAME,
+								Filesystem::signal_post_rename,
+								[
+									Filesystem::signal_param_oldpath => $this->getHookPath($path1),
+									Filesystem::signal_param_newpath => $this->getHookPath($path2)
+								]
+							);
+							$this->eventDispatcher->dispatch('view.afterrename.data', $event);
+						}
 					}
 				}
-
-				$this->changeLock($path1, ILockingProvider::LOCK_SHARED, true);
-				$this->changeLock($path2, ILockingProvider::LOCK_SHARED, true);
-
-				if ((Cache\Scanner::isPartialFile($path1) && !Cache\Scanner::isPartialFile($path2)) && $result !== false) {
-					if ($this->shouldEmitHooks()) {
-						$this->emit_file_hooks_post($exists, $path2);
-					}
-				} elseif ($result) {
-					if ($this->shouldEmitHooks($path1) and $this->shouldEmitHooks($path2)) {
-						\OC_Hook::emit(
-							Filesystem::CLASSNAME,
-							Filesystem::signal_post_rename,
-							[
-								Filesystem::signal_param_oldpath => $this->getHookPath($path1),
-								Filesystem::signal_param_newpath => $this->getHookPath($path2)
-							]
-						);
-					}
-				}
+				$this->unlockFile($path1, ILockingProvider::LOCK_SHARED, true);
+				$this->unlockFile($path2, ILockingProvider::LOCK_SHARED, true);
 			}
-			$this->unlockFile($path1, ILockingProvider::LOCK_SHARED, true);
-			$this->unlockFile($path2, ILockingProvider::LOCK_SHARED, true);
-		}
-		return $result;
+
+			if ($result === true) {
+				try {
+					$event->setArgument('newfileinfo', $this->getFileInfo($path2));
+				} catch (\Exception $e) {
+					$this->logger->warning(__METHOD__ . " failed to retrieve file info for $path2");
+				}
+				$this->eventDispatcher->dispatch('view.afterrename.data', $event);
+			}
+			return $result;
+		}, [], 'view', 'rename');
 	}
 
 	/**
@@ -832,92 +947,108 @@ class View {
 	 * @return bool|mixed
 	 */
 	public function copy($path1, $path2, $preserveMtime = false) {
-		$absolutePath1 = Filesystem::normalizePath($this->getAbsolutePath($path1));
-		$absolutePath2 = Filesystem::normalizePath($this->getAbsolutePath($path2));
-		$result = false;
-		if (
-			Filesystem::isValidPath($path2)
-			and Filesystem::isValidPath($path1)
-			and !Filesystem::isForbiddenFileOrDir($path2)
-		) {
-			$path1 = $this->getRelativePath($absolutePath1);
-			$path2 = $this->getRelativePath($absolutePath2);
+		return $this->emittingCall(function () use (&$path1, &$path2, &$preserveMtime) {
+			$absolutePath1 = Filesystem::normalizePath($this->getAbsolutePath($path1));
+			$absolutePath2 = Filesystem::normalizePath($this->getAbsolutePath($path2));
+			$result = false;
+			$event = new GenericEvent(null, []);
+			if (
+				Filesystem::isValidPath($path2)
+				and Filesystem::isValidPath($path1)
+				and !Filesystem::isForbiddenFileOrDir($path2)
+			) {
+				$path1 = $this->getRelativePath($absolutePath1);
+				$path2 = $this->getRelativePath($absolutePath2);
 
-			if ($path1 == null or $path2 == null) {
-				return false;
-			}
-			$run = true;
-
-			$this->lockFile($path2, ILockingProvider::LOCK_SHARED);
-			$this->lockFile($path1, ILockingProvider::LOCK_SHARED);
-			$lockTypePath1 = ILockingProvider::LOCK_SHARED;
-			$lockTypePath2 = ILockingProvider::LOCK_SHARED;
-
-			try {
-
-				$exists = $this->file_exists($path2);
-				if ($this->shouldEmitHooks()) {
-					\OC_Hook::emit(
-						Filesystem::CLASSNAME,
-						Filesystem::signal_copy,
-						[
-							Filesystem::signal_param_oldpath => $this->getHookPath($path1),
-							Filesystem::signal_param_newpath => $this->getHookPath($path2),
-							Filesystem::signal_param_run => &$run
-						]
-					);
-					$this->emit_file_hooks_pre($exists, $path2, $run);
+				if ($path1 == null or $path2 == null) {
+					return false;
 				}
-				if ($run) {
-					$mount1 = $this->getMount($path1);
-					$mount2 = $this->getMount($path2);
-					$storage1 = $mount1->getStorage();
-					$internalPath1 = $mount1->getInternalPath($absolutePath1);
-					$storage2 = $mount2->getStorage();
-					$internalPath2 = $mount2->getInternalPath($absolutePath2);
+				$run = true;
+				$event->setArgument('oldpath', $path1);
+				$event->setArgument('oldpathfileinfo', $this->getFileInfo($path1));
+				$event->setArgument('newpath', $path2);
 
-					$this->changeLock($path2, ILockingProvider::LOCK_EXCLUSIVE);
-					$lockTypePath2 = ILockingProvider::LOCK_EXCLUSIVE;
+				$this->lockFile($path2, ILockingProvider::LOCK_SHARED);
+				$this->lockFile($path1, ILockingProvider::LOCK_SHARED);
+				$lockTypePath1 = ILockingProvider::LOCK_SHARED;
+				$lockTypePath2 = ILockingProvider::LOCK_SHARED;
 
-					if ($mount1->getMountPoint() == $mount2->getMountPoint()) {
-						if ($storage1) {
-							$result = $storage1->copy($internalPath1, $internalPath2);
-						} else {
-							$result = false;
-						}
-					} else {
-						$result = $storage2->copyFromStorage($storage1, $internalPath1, $internalPath2);
-					}
+				try {
 
-					$this->writeUpdate($storage2, $internalPath2);
-
-					$this->changeLock($path2, ILockingProvider::LOCK_SHARED);
-					$lockTypePath2 = ILockingProvider::LOCK_SHARED;
-
-					if ($this->shouldEmitHooks() && $result !== false) {
+					$exists = $this->file_exists($path2);
+					if ($this->shouldEmitHooks()) {
 						\OC_Hook::emit(
 							Filesystem::CLASSNAME,
-							Filesystem::signal_post_copy,
+							Filesystem::signal_copy,
 							[
 								Filesystem::signal_param_oldpath => $this->getHookPath($path1),
-								Filesystem::signal_param_newpath => $this->getHookPath($path2)
+								Filesystem::signal_param_newpath => $this->getHookPath($path2),
+								Filesystem::signal_param_run => &$run
 							]
 						);
-						$this->emit_file_hooks_post($exists, $path2);
+						$this->eventDispatcher->dispatch('view.beforecopy.data', $event);
+						$this->emit_file_hooks_pre($exists, $path2, $run);
 					}
+					if ($run) {
+						$mount1 = $this->getMount($path1);
+						$mount2 = $this->getMount($path2);
+						$storage1 = $mount1->getStorage();
+						$internalPath1 = $mount1->getInternalPath($absolutePath1);
+						$storage2 = $mount2->getStorage();
+						$internalPath2 = $mount2->getInternalPath($absolutePath2);
 
+						$this->changeLock($path2, ILockingProvider::LOCK_EXCLUSIVE);
+						$lockTypePath2 = ILockingProvider::LOCK_EXCLUSIVE;
+
+						if ($mount1->getMountPoint() == $mount2->getMountPoint()) {
+							if ($storage1) {
+								$result = $storage1->copy($internalPath1, $internalPath2);
+							} else {
+								$result = false;
+							}
+						} else {
+							$result = $storage2->copyFromStorage($storage1, $internalPath1, $internalPath2);
+						}
+
+						$this->writeUpdate($storage2, $internalPath2);
+
+						$this->changeLock($path2, ILockingProvider::LOCK_SHARED);
+						$lockTypePath2 = ILockingProvider::LOCK_SHARED;
+
+						if ($this->shouldEmitHooks() && $result !== false) {
+							\OC_Hook::emit(
+								Filesystem::CLASSNAME,
+								Filesystem::signal_post_copy,
+								[
+									Filesystem::signal_param_oldpath => $this->getHookPath($path1),
+									Filesystem::signal_param_newpath => $this->getHookPath($path2)
+								]
+							);
+							$this->eventDispatcher->dispatch('view.aftercopy.data', $event);
+							$this->emit_file_hooks_post($exists, $path2);
+						}
+
+					}
+				} catch (\Exception $e) {
+					$this->unlockFile($path2, $lockTypePath2);
+					$this->unlockFile($path1, $lockTypePath1);
+					throw $e;
 				}
-			} catch (\Exception $e) {
+
 				$this->unlockFile($path2, $lockTypePath2);
 				$this->unlockFile($path1, $lockTypePath1);
-				throw $e;
+
 			}
-
-			$this->unlockFile($path2, $lockTypePath2);
-			$this->unlockFile($path1, $lockTypePath1);
-
-		}
-		return $result;
+			if ($result === true) {
+				try {
+					$event->setArgument('newpathfileinfo', $this->getFileInfo($path2));
+				} catch (\Exception $e) {
+					$this->logger->warning(__METHOD__ . " failed to retrieve file info for $path2");
+				}
+				$this->eventDispatcher->dispatch('view.aftercopy.data', $event);
+			}
+			return $result;
+		}, ['before' => []], 'view', 'copy');
 	}
 
 	/**
@@ -1051,6 +1182,13 @@ class View {
 					Filesystem::signal_read,
 					[Filesystem::signal_param_path => $this->getHookPath($path)]
 				);
+			}
+			$e = new \Exception();
+			$event = new GenericEvent(null, ['path' => $this->getHookPath($path)]);
+			try {
+				$event->setArgument('fileinfo', $this->getFileInfo($path));
+			} catch (\Exception $e) {
+				$this->logger->warning(__METHOD__ . " failed to retrieve file info for $path");
 			}
 			list($storage, $internalPath) = Filesystem::resolvePath($absolutePath . $postFix);
 			if ($storage) {
