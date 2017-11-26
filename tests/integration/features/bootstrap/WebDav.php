@@ -4,7 +4,6 @@ use GuzzleHttp\Client as GClient;
 use Sabre\DAV\Client as SClient;
 use Sabre\DAV\Xml\Property\ResourceType;
 use GuzzleHttp\Exception\ServerException;
-use Psr\Http\Message\ResponseInterface;
 use GuzzleHttp\Psr7\Request;
 use TestHelpers\WebDavHelper;
 
